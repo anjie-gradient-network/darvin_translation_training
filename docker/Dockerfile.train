@@ -1,0 +1,21 @@
+FROM hiyouga/llamafactory:latest
+
+# Base image details (as of 2025-01):
+# - Ubuntu 22.04 (x86_64)
+# - CUDA 12.4
+# - Python 3.11
+# - PyTorch 2.6.0
+# - Flash-attn 2.7.4
+
+SHELL ["/bin/bash", "-lc"]
+
+ENV LC_ALL=C.UTF-8 \
+    LANG=C.UTF-8 \
+    HF_HOME=/root/.cache/huggingface \
+    PYTHONUNBUFFERED=1
+
+# Workdir will be bind-mounted by docker-compose to your repo root at runtime.
+WORKDIR /tmp/workspace/train
+
+# The training command and data/model mounts are configured in docker-compose.yml
+

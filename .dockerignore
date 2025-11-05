@@ -1,0 +1,23 @@
+# Keep the build context small; runtime mounts bring code/model/data in
+.git
+.gitignore
+.gitattributes
+.gitmodules
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.tmp
+*.ipynb
+*.csv
+
+# Large assets / outputs are mounted at runtime
+basemodel/
+output/
+data/
+
+# OS junk
+.DS_Store
+Thumbs.db

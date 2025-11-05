@@ -1,0 +1,33 @@
+version: "3.8"
+
+services:
+  trainer:
+    # Build a thin training image based on the official LLaMA-Factory image
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.train
+    image: darvin-translation/trainer:latest
+    # Shared memory settings for PyTorch/DataLoader stability
+    ipc: host
+    shm_size: "16g"
+    restart: "no"
+    environment:
+      # Paths used by train-0/prepare_v2.py (see its defaults and env overrides)
+      - BASE_MODEL_DIR=/tmp/workspace/source_model
+      # Use repo root as TRAIN_FILE_DIR so translate_0.csv in root is picked up without moving files
+      - TRAIN_FILE_DIR=/tmp/workspace/train
+      - TARGET_MODEL_DIR=/tmp/workspace/target_model
+    volumes:
+      # Mount the repo to the expected working directory for the scripts
+      - ./:/tmp/workspace/train:rw
+      # Mount base model directory (must exist on host)
+      - ./basemodel:/tmp/workspace/source_model:ro
+      # Persist training outputs on host
+      - ./output:/tmp/workspace/target_model:rw
+    # Copy prepare_v2.py to the expected location and run the provided training script
+    command: >-
+      bash -lc "\
+        set -euo pipefail; \
+        cp -f /tmp/workspace/train/train-0/prepare_v2.py /tmp/workspace/train/; \
+        cd /tmp/workspace/train/train-0; \
+        bash train.sh"
