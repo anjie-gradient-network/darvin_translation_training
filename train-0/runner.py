@@ -15,11 +15,9 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -32,6 +30,14 @@ from urllib.request import Request, urlopen
 from urllib.parse import urlparse
 import http.client
 import zipfile
+import hashlib
+
+try:
+    import oss2  # type: ignore
+    from oss2.credentials import EnvironmentVariableCredentialsProvider  # type: ignore
+    _HAS_OSS2 = True
+except Exception:
+    _HAS_OSS2 = False
 
 
 def _now_ts() -> int:
@@ -353,19 +359,108 @@ class Runner:
             # non-blocking
             pass
 
-        # If upload URL is provided by backend, upload the artifact and carry back the CID
-        tm_cid: Optional[str] = None
-        if self.ctx.upload_url and zip_path.exists():
-            try:
-                print(f"[darvin-runner] start upload: path={zip_path} size_mb={zip_path.stat().st_size/1024/1024:.2f} url={self.ctx.upload_url}", file=sys.stderr)
-                tm_cid = self._upload_trained_model(zip_path)
-                print(f"[darvin-runner] upload done: cid={tm_cid}", file=sys.stderr)
-            except Exception as exc:
-                # Report failure and bubble up
-                self._callback("failed", message=f"upload_failed: {exc}")
-                raise
-
+        if not zip_path.exists():
+            self._callback("failed", message="trained_model_zip_missing")
+            raise RuntimeError("trained_model_zip_missing")
+        sess_url = os.getenv("DARVIN_UPLOAD_SESSION_URL")
+        done_url = os.getenv("DARVIN_UPLOAD_COMPLETE_URL")
+        if not (sess_url and done_url and _HAS_OSS2):
+            self._callback("failed", message="direct_upload_not_configured")
+            raise RuntimeError("direct_upload_not_configured")
+        tm_cid = self._direct_upload_via_oss(zip_path, sess_url, done_url)
         self._callback("completed", progress=100, trained_model_cid=tm_cid)
+
+    def _direct_upload_via_oss(self, file_path: Path, session_url: str, complete_url: str) -> str:
+        """Upload trained_model.zip directly to OSS using multipart and register.
+
+        Returns trained_model_cid.
+        """
+        if not _HAS_OSS2:
+            raise RuntimeError("oss2_not_available")
+
+        # Hashes and size
+        sha256_hex, md5_hex, size = self._hashes_and_size(file_path)
+
+        # Create upload session
+        payload = {
+            "job_id": self.ctx.job_id,
+            "job_token": self.ctx.job_token,
+            "filename": file_path.name,
+            "file_type": "training_result",
+            "file_size": size,
+            "sha256_hex": sha256_hex,
+            "md5": md5_hex,
+        }
+        sess = _post_json(session_url, payload, timeout=20)
+        data = sess.get("data") if isinstance(sess, dict) else None
+        if not isinstance(data, dict):
+            raise RuntimeError("invalid_session_response")
+        bucket = data.get("bucket")
+        endpoint = data.get("endpoint")
+        region = data.get("region")
+        object_key = data.get("object_key")
+        part_size = int(data.get("part_size") or 32 * 1024 * 1024)
+        cred = data.get("credentials") if isinstance(data.get("credentials"), dict) else {}
+        ak = (cred.get("access_key_id") or "").strip()
+        sk = (cred.get("access_key_secret") or "").strip()
+        st = (cred.get("security_token") or "").strip()
+        if not all([bucket, endpoint, region, object_key]):
+            raise RuntimeError("session_missing_fields")
+
+        # Build auth: prefer provided credentials; fallback to env provider
+        if ak and sk:
+            if st:
+                auth = oss2.StsAuth(ak, sk, st)
+            else:
+                auth = oss2.Auth(ak, sk)
+        else:
+            auth = oss2.ProviderAuthV4(EnvironmentVariableCredentialsProvider())
+        bkt = oss2.Bucket(auth, endpoint, bucket, region=region)
+        headers = {"x-oss-meta-sha256": sha256_hex, "x-oss-meta-md5": md5_hex}
+        oss2.resumable_upload(
+            bkt,
+            object_key,
+            str(file_path),
+            headers=headers,
+            multipart_threshold=part_size,
+            part_size=part_size,
+            num_threads=max(1, min(os.cpu_count() or 2, 4)),
+        )
+
+        # Complete register
+        res = _post_json(
+            complete_url,
+            {
+                "job_id": self.ctx.job_id,
+                "job_token": self.ctx.job_token,
+                "filename": file_path.name,
+                "file_type": "training_result",
+                "file_size": size,
+                "sha256_hex": sha256_hex,
+                "md5": md5_hex,
+                "object_key": object_key,
+            },
+            timeout=20,
+        )
+        obj = res.get("data") if isinstance(res, dict) else None
+        tm_cid = (obj or {}).get("trained_model_cid") if isinstance(obj, dict) else None
+        if not tm_cid:
+            raise RuntimeError("register_no_cid")
+        return str(tm_cid)
+
+    def _hashes_and_size(self, file_path: Path) -> Tuple[str, str, int]:
+        sha256 = hashlib.sha256()
+        md5 = hashlib.md5()
+        total = 0
+        with file_path.open("rb") as f:
+            while True:
+                buf = f.read(1024 * 1024)
+                if not buf:
+                    break
+                total += len(buf)
+                sha256.update(buf)
+                md5.update(buf)
+        return sha256.hexdigest(), md5.hexdigest(), total
 
     # --------------------------- Upload helpers ----------------------------
     def _upload_trained_model(self, file_path: Path) -> str:

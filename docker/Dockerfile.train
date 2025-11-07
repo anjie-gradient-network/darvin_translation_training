@@ -32,6 +32,9 @@ RUN test -f /tmp/workspace/train/train-0/runner.py \
  && test -f /tmp/workspace/train/train-0/prepare_v2.py \
  && python -m py_compile /tmp/workspace/train/train-0/runner.py
 
+# Minimal runtime deps for direct OSS upload
+RUN pip install --no-cache-dir oss2
+
 # The training command and data/model mounts are configured in docker-compose.yml
 
 # Default entrypoint for cluster runs (can be overridden by docker-compose command)
