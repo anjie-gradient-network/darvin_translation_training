@@ -23,6 +23,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass
+import fnmatch
 import random
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -322,14 +323,30 @@ class Runner:
             (self.ctx.output_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
             pass
-        # zip main outputs for convenience
+        # zip main outputs for convenience（固定排除 checkpoint-* 目录）
         zip_path = self.ctx.output_dir / "trained_model.zip"
+        # 固定排除规则：路径的任一组件匹配 checkpoint-* 即跳过
+        exclude_patterns = ["checkpoint-*"]
+
+        def _excluded(rel: Path) -> bool:
+            s = str(rel)
+            for pat in exclude_patterns:
+                if fnmatch.fnmatchcase(s, pat):
+                    return True
+                for part in rel.parts:
+                    if fnmatch.fnmatchcase(part, pat):
+                        return True
+            return False
         try:
             with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
                 for p in self.ctx.output_dir.rglob("*"):
                     if p.is_file() and p.name != zip_path.name:
+                        rel = p.relative_to(self.ctx.output_dir)
+                        if _excluded(rel):
+                            # Skip excluded files quietly
+                            continue
                         try:
-                            zf.write(p, p.relative_to(self.ctx.output_dir))
+                            zf.write(p, rel)
                         except Exception:
                             continue
         except Exception:
