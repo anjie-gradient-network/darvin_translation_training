@@ -15,10 +15,10 @@ echo "run demo"
 #     cd /tmp/workspace/train && llamafactory-cli train train.yaml
 # fi
 # echo "only sft"
-# cd /tmp/workspace/train && python prepare_v2.py
-# cd /tmp/workspace/train && llamafactory-cli train train.yaml
+cd /tmp/workspace/train && python train-0/prepare_v2.py
+cd /tmp/workspace/train && llamafactory-cli train train.yaml
 # echo "pt and sft"
-cd /tmp/workspace/train && python prepare_v2.py --current_stage 0 --do_pt
-cd /tmp/workspace/train && llamafactory-cli train train.yaml
-cd /tmp/workspace/train && python prepare_v2.py --current_stage 1 --do_pt
-cd /tmp/workspace/train && llamafactory-cli train train.yaml
+# cd /tmp/workspace/train && python train-0/prepare_v2.py --current_stage 0 --do_pt
+# cd /tmp/workspace/train && llamafactory-cli train train.yaml
+# cd /tmp/workspace/train && python train-0/prepare_v2.py --current_stage 1 --do_pt
+# cd /tmp/workspace/train && llamafactory-cli train train.yaml
