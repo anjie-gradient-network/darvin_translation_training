@@ -13,11 +13,6 @@ __pycache__
 *.ipynb
 *.csv
 
-# Large assets / outputs are mounted at runtime
-basemodel/
-output/
-data/
-
 # OS junk
 .DS_Store
 Thumbs.db

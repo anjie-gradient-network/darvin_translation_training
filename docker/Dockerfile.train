@@ -12,10 +12,30 @@ SHELL ["/bin/bash", "-lc"]
 ENV LC_ALL=C.UTF-8 \
     LANG=C.UTF-8 \
     HF_HOME=/root/.cache/huggingface \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    BASE_MODEL_DIR=/opt/darvin/base_model
 
 # Workdir will be bind-mounted by docker-compose to your repo root at runtime.
 WORKDIR /tmp/workspace/train
 
+# Bake base model into the image (override via env if needed)
+COPY basemodel/ ${BASE_MODEL_DIR}/
+
+# Embed training orchestrator scripts for cluster/cloud runs
+# In local docker-compose we bind-mount the repo to /tmp/workspace/train,
+# but in cloud environments there is no bind mount, so we must bake
+# train-0 (runner.py, prepare_v2.py, etc.) into the image.
+COPY train-0/ /tmp/workspace/train/train-0/
+
+# Build-time sanity checks to ensure runner and scripts exist in the image.
+RUN test -f /tmp/workspace/train/train-0/runner.py \
+ && test -f /tmp/workspace/train/train-0/prepare_v2.py \
+ && python -m py_compile /tmp/workspace/train/train-0/runner.py
+
+# Minimal runtime deps for direct OSS upload
+RUN pip install --no-cache-dir oss2
+
 # The training command and data/model mounts are configured in docker-compose.yml
 
+# Default entrypoint for cluster runs (can be overridden by docker-compose command)
+ENTRYPOINT ["python", "-u", "/tmp/workspace/train/train-0/runner.py"]

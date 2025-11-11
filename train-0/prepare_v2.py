@@ -8,11 +8,17 @@ import yaml
 import gc
 import logging
 import pandas as pd
-import glob
 from collections import Counter
 from copy import deepcopy
 from tqdm import tqdm, trange
 from transformers import AutoTokenizer
+try:
+    from .darvin_dataset import load_dataframe
+except Exception:  # executed as script
+    import os as _os
+    import sys as _sys
+    _sys.path.append(_os.path.dirname(__file__))
+    from darvin_dataset import load_dataframe
 
 # logger = logging.getLogger('my_logger')
 # logger.setLevel(logging.INFO)
@@ -57,10 +63,10 @@ LANGUAGE_MAPPING = {
     # "ko": "Korean",
     # "hi": "Hindi",  
 }
-used_languages = ['zh', 'en', 'ru', 'fr', 'ar', 'pt', 'es', ]
+used_languages = ['zh', 'en', 'ru', 'fr', 'ar', 'pt', 'es', 'vi']
 used_languages_mapper = [
     # 'zh2en', 'zh2ru', 'zh2fr', 'zh2ar', 'zh2pt', 'zh2es', 
-    'en2zh', 'en2ru', 'en2fr', 'en2ar', 'en2pt', 'en2es', 
+    'en2zh', 'en2ru', 'en2fr', 'en2ar', 'en2pt', 'en2es', 'en2vi',
 ]
 # used_languages = ['zh', 'en', 'ru', 'fr', 'ar', 'pt', 'es', 'pl']
 # used_languages_mapper = [
@@ -70,13 +76,10 @@ used_languages_mapper = [
 sample_dict = {k:0 for k in used_languages_mapper}
 
 def parse_args():
-
     parse = argparse.ArgumentParser()
     parse.add_argument('--do_pt', default=False, action='store_true')
-    # parse.add_argument('--use_lora', default=False, action='store_true')
-    parse.add_argument( '--current_stage', default=0, type=int,)
+    parse.add_argument('--current_stage', default=0, type=int)
     args = parse.parse_args()
-
     return args
 
 args = parse_args()
@@ -93,7 +96,9 @@ MAX_LANG_SAMPLE_SIZE = MAX_SAMPLE_SIZE // len(used_languages_mapper)
 PER_BATCH_SIZE = 16 # 32
 ACC_STEPS = 8
 base_model_dir = os.getenv("BASE_MODEL_DIR") or "/tmp/workspace/source_model"
-train_file_dir = os.getenv("TRAIN_FILE_DIR") or "/tmp/ds"
+# New: Darvin dataset sources — prefer bundle path, else dataset dir (extracted bundle or zips directory)
+train_bundle_path = os.getenv("DARVIN_TRAIN_BUNDLE_PATH")
+train_dataset_dir = os.getenv("DARVIN_DATASET_DIR") or os.getenv("TRAIN_FILE_DIR") or "/tmp/ds"
 # adapter_path = "/tmp/adapter"
 # sft_path = '/tmp/workspace/train/full_sft'
 mid_model_dir = "/tmp/workspace/target_model"
@@ -102,60 +107,65 @@ train_yaml_filepath = "/tmp/workspace/train/train.yaml"
 # merge_yaml_filepath = "/tmp/workspace/train/merge.yaml"
 dataset_info_filepath = "/tmp/workspace/train/data/dataset_info.json"
 logging.info("base_model_dir: {}".format(base_model_dir))
-logging.info("train_file_dir: {}".format(train_file_dir))
+logging.info("train_bundle_path: {}".format(train_bundle_path))
+logging.info("train_dataset_dir: {}".format(train_dataset_dir))
 logging.info("target_model_dir: {}".format(target_model_dir))
 logging.info("train_yaml_filepath: {}".format(train_yaml_filepath))
 # logging.info("merge_yaml_filepath: {}".format(merge_yaml_filepath))
 
 time_start = time.time()
-# ---preprocess csv files---
 tokenizer = AutoTokenizer.from_pretrained(base_model_dir)
-data_list = glob.glob('{}/*.csv'.format(train_file_dir))
-logging.info('csv file num: {}'.format(len(data_list)))
-# sample_size = MAX_SAMPLE_SIZE//len(data_list)
-# logging.info('each file sample_size: {}'.format(sample_size))
+
+# ---load Darvin datasets (ZIP with dataset_schema.json + annotations.jsonl)---
+try:
+    if train_bundle_path:
+        df = load_dataframe(bundle_path=train_bundle_path)
+    else:
+        df = load_dataframe(dataset_dir=train_dataset_dir)
+except Exception as e:
+    logging.error(f"Failed to load Darvin dataset(s): {e}")
+    raise
+
+# filter and sample by languages and token length budget
+df = df.dropna()
+df = df[df['from'].isin(used_languages)]
+df = df[df['to'].isin(used_languages)]
+df['a2b'] = df.apply(lambda x: '{}2{}'.format(x['from'], x['to']), axis=1)
+df['b2a'] = df.apply(lambda x: '{}2{}'.format(x['to'], x['from']), axis=1)
+df['used_tag'] = df.apply(lambda x: (x['a2b'] in used_languages_mapper) or (x['b2a'] in used_languages_mapper), axis=1)
+df = df[df['used_tag'] == True]
+
 dfs = []
-for dl in tqdm(data_list):
-    tmp = pd.read_csv(dl)
-    tmp = tmp.loc[:, ['from', 'to', 'text', 'translated']]
-    logging.info('file_name: {}, sample_num: {}'.format(dl, len(tmp)))
-    tmp = tmp.dropna()
-    tmp = tmp[tmp['from'].isin(used_languages)]
-    tmp = tmp[tmp['to'].isin(used_languages)]
-    tmp['a2b'] = tmp.apply(lambda x: '{}2{}'.format(x['from'], x['to']),axis=1)
-    tmp['b2a'] = tmp.apply(lambda x: '{}2{}'.format(x['to'], x['from']),axis=1)
-    tmp['used_tag'] = tmp.apply(lambda x: (x['a2b'] in used_languages_mapper) or (x['b2a'] in used_languages_mapper),axis=1)
-    tmp = tmp[tmp['used_tag']==True]
+for _, group in df.groupby(['from', 'to'], sort=False):
+    tmp = group.copy()
     if len(tmp) == 0:
         continue
     ts = []
     ulms = list(set(tmp['a2b'].tolist() + tmp['b2a'].tolist()) & set(used_languages_mapper))
-    loop_tag = False
-    for ulm in ulms:
-        if sample_dict[ulm] < MAX_LANG_SAMPLE_SIZE:
-            loop_tag = True
-            break
+    loop_tag = any(sample_dict[ulm] < MAX_LANG_SAMPLE_SIZE for ulm in ulms)
     if not loop_tag:
         continue
     for ulm in ulms:
         if sample_dict[ulm] >= MAX_LANG_SAMPLE_SIZE:
             continue
-        t = pd.concat([tmp[tmp['a2b']==ulm], tmp[tmp['b2a']==ulm]])
-        t['concated'] = t.apply(lambda x: '\n'.join([x['text'], x['translated']]),axis=1)
+        t = pd.concat([tmp[tmp['a2b'] == ulm], tmp[tmp['b2a'] == ulm]])
+        t['concated'] = t.apply(lambda x: '\n'.join([str(x['text']), str(x['translated'])]), axis=1)
         t['token_num'] = t['concated'].map(lambda x: len(tokenizer(x)['input_ids']))
-        t = t[t['token_num']<=MAX_TOKEN_SIZE]
+        t = t[t['token_num'] <= MAX_TOKEN_SIZE]
         t_num = min(len(t), MAX_LANG_SAMPLE_SIZE - sample_dict[ulm])
         if t_num <= 0:
             continue
         t = t.sample(n=t_num)
         ts.append(t)
         sample_dict[ulm] += t_num
-    if len(ts) == 0:
-        continue
-    tmp = pd.concat(ts)
-    del tmp['concated'], tmp['token_num'], tmp['a2b'], tmp['b2a'], tmp['used_tag']
-    gc.collect()
-    dfs.append(tmp)
+    if ts:
+        tmp2 = pd.concat(ts)
+        tmp2 = tmp2.drop(columns=['concated', 'token_num'], errors='ignore')
+        dfs.append(tmp2)
+        gc.collect()
+
+if not dfs:
+    raise ValueError("no_samples_after_language_and_token_filters")
 df = pd.concat(dfs)
 df = df.drop_duplicates(keep='first', ignore_index=True)
 df = df.astype(str)
@@ -171,7 +181,7 @@ df2['from'] = df['to']
 df2['to'] = df['from']
 df2['text'] = df['translated']
 df2['translated'] = df['text']
-df = pd.concat([df,df2], ignore_index=True)
+df = pd.concat([df, df2], ignore_index=True)
 df = df.drop_duplicates(keep='first', ignore_index=True)
 del df2
 gc.collect()
@@ -242,6 +252,7 @@ else:
             "system_tag": "system"
         }
     }
+os.makedirs(os.path.dirname(dataset_info_filepath), exist_ok=True)
 with open(dataset_info_filepath, "w") as f:
     f.write(json.dumps(dataset_info, indent=2, ensure_ascii=False))
 
@@ -291,9 +302,9 @@ if (do_pt) and (current_stage==0):
         "bf16": True,
         "ddp_timeout": 180000000,
 
-        "val_size": 0.1,
+        "val_size": 0.0,
         "per_device_eval_batch_size": 1,
-        "eval_strategy": "steps",
+        "eval_strategy": "no",
         "eval_steps": eval_step
     }
 
@@ -338,9 +349,9 @@ elif (do_pt) and (current_stage==1):
         "bf16": True,
         "ddp_timeout": 180000000,
 
-        "val_size": 0.1,
+        "val_size": 0.0,
         "per_device_eval_batch_size": 1,
-        "eval_strategy": "steps",
+        "eval_strategy": "no",
         "eval_steps": eval_step
     }
 
@@ -385,9 +396,9 @@ else:
         "bf16": True,
         "ddp_timeout": 180000000,
 
-        "val_size": 0.1,
+        "val_size": 0.0,
         "per_device_eval_batch_size": 1,
-        "eval_strategy": "steps",
+        "eval_strategy": "no",
         "eval_steps": eval_step
     }
 
